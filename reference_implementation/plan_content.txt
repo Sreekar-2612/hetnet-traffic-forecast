@@ -1,0 +1,368 @@
+TASTF
+Tier-Aware Spatiotemporal Forecasting for HetNets
+Full Implementation Plan  |  Solution 2  |  6-8 Hour Sprint
+April 2026  |  PyTorch + PyTorch Geometric  |  Telecom Italia Dataset
+Project overview
+TASTF is a novel spatiotemporal forecasting model for Heterogeneous Cellular Networks (HetNets). The core contribution is a heterogeneous graph that treats macro, pico, and femto base stations as distinct node types with type-specific graph convolutional layers — something no prior published work (HGCRN, GAST, MVSTGN) does. This is the novelty claim that makes the work publishable at IEEE Communications Letters or IEEE TMC.
+Target venues
+IEEE Commun. Letters, IEEE TMC, IEEE JSAC
+Stack
+Python, PyTorch, PyTorch Geometric (PyG)
+Dataset
+Telecom Italia Big Data Challenge (Milan)
+Architecture
+The model has three sequential components:
+Layer
+Component
+What it does
+1
+HeteroGNNEncoder
+Applies type-specific SAGEConv layers per node type (macro / pico / femto) using PyG HeteroConv. This is the core novelty — no prior work separates BS tiers in the graph.
+2
+PositionalEncoding + TransformerEncoder
+Stacks GNN outputs over T=12 timesteps into a sequence. PyTorch nn.TransformerEncoder models long-range temporal dependencies via self-attention.
+3
+Linear prediction head
+Projects the final Transformer output to H=3 forecast horizon values per node. Output shape: (batch, horizon, N_cells).
+Hour-by-hour implementation plan
+1
+Environment + dataset setup
+Hour 0:00 – 0:45
+Install dependencies
+pip install torch-geometric torch-scatter torch-sparse pandas numpy scikit-learn
+Download dataset
+Go to: https://dandelion.eu/datagems/SpazioDati/telecom-sms-call-internet-mi/resource/
+Free registration required. Download the November 2013 grid activity files. Place them in a ./data/ folder.
+data_loader.py
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+def load_telecom_italia(data_dir, n_cells=100, seq_len=12, horizon=3):
+    df = pd.read_csv(f'{data_dir}/sms-call-internet-mi-2013-11.txt',
+                     sep='\t', header=None,
+                     names=['interval','grid','sms_in','sms_out',
+                            'call_in','call_out','internet'])
+    df = df[df['grid'] <= n_cells].fillna(0)
+    df['activity'] = df['internet'] + df['call_in'] + df['call_out']
+    pivot = df.pivot_table(index='interval', columns='grid',
+                           values='activity', fill_value=0)
+    data = pivot.values.astype(np.float32)   # (T, N)
+    scaler = MinMaxScaler()
+    data = scaler.fit_transform(data)         # normalise to [0, 1]
+    X, y = [], []
+    for t in range(len(data) - seq_len - horizon):
+        X.append(data[t : t+seq_len])
+        y.append(data[t+seq_len : t+seq_len+horizon])
+    X, y = np.stack(X), np.stack(y)          # (samples, seq, N)
+    s1, s2 = int(0.7*len(X)), int(0.8*len(X))
+    return (X[:s1],y[:s1]), (X[s1:s2],y[s1:s2]), (X[s2:],y[s2:]), scaler
+Checkpoint  Running data_loader.py prints tensor shape (samples, 12, 100) without error.
+2
+Heterogeneous graph construction  [CORE NOVELTY]
+Hour 0:45 – 2:00
+This is the contribution that differentiates TASTF from every prior work. The key idea: instead of one node type for all base stations, we assign macro / pico / femto types by activity threshold and build type-specific edges.
+Tier assignment logic
+Top 10% mean activity  →  Macro BS  (high power, wide coverage)
+Bottom 30% mean activity  →  Femto BS  (low power, indoor)
+Remaining 60%  →  Pico BS  (medium)
+Edge types
+geo edges  —  k-NN geographic proximity within each tier (same-tier spatial coupling)
+cross_tier edges  —  macro-to-pico and macro-to-femto (inter-tier load influence)
+graph_builder.py
+import torch, numpy as np
+from torch_geometric.data import HeteroData
+def build_hetero_graph(data_matrix, k=5, macro_pct=0.10, femto_pct=0.30):
+    T, N = data_matrix.shape
+    mean_act = data_matrix.mean(axis=0)
+    sorted_idx = np.argsort(mean_act)
+    n_femto = int(N * femto_pct)
+    n_macro = int(N * macro_pct)
+    femto_idx = sorted_idx[:n_femto]
+    macro_idx = sorted_idx[-n_macro:]
+    pico_idx  = sorted_idx[n_femto:-n_macro]
+    macro_local = {g:l for l,g in enumerate(macro_idx)}
+    pico_local  = {g:l for l,g in enumerate(pico_idx)}
+    femto_local = {g:l for l,g in enumerate(femto_idx)}
+    hetero = HeteroData()
+    hetero['macro'].x = torch.tensor(mean_act[macro_idx]).unsqueeze(1)
+    hetero['pico'].x  = torch.tensor(mean_act[pico_idx]).unsqueeze(1)
+    hetero['femto'].x = torch.tensor(mean_act[femto_idx]).unsqueeze(1)
+    sqrt_n = int(np.sqrt(N))
+    coords = np.array([[i//sqrt_n, i%sqrt_n] for i in range(N)], dtype=np.float32)
+    def knn_edges(src_ids, dst_ids, k):
+        src_e, dst_e = [], []
+        local_maps = {**macro_local, **pico_local, **femto_local}
+        for s_g in src_ids:
+            dists = np.linalg.norm(coords[dst_ids] - coords[s_g], axis=1)
+            nns = np.argsort(dists)[1:k+1]
+            for d_l in nns:
+                d_g = dst_ids[d_l]
+                src_e.append(local_maps[s_g])
+                dst_e.append(local_maps[d_g])
+        return torch.tensor([src_e, dst_e], dtype=torch.long)
+    hetero['macro','geo','macro'].edge_index = knn_edges(macro_idx,macro_idx,k)
+    hetero['pico','geo','pico'].edge_index   = knn_edges(pico_idx,pico_idx,k)
+    hetero['femto','geo','femto'].edge_index = knn_edges(femto_idx,femto_idx,k)
+    hetero['macro','cross','pico'].edge_index  = knn_edges(macro_idx,pico_idx,k)
+    hetero['macro','cross','femto'].edge_index = knn_edges(macro_idx,femto_idx,k)
+    return hetero, macro_idx, pico_idx, femto_idx
+Checkpoint  hetero_data['macro'].num_nodes, ['pico'].num_nodes, ['femto'].num_nodes all print correct counts.
+3+4
+ST-GNN encoder + Transformer decoder
+Hour 2:00 – 5:00
+Build both in a single model.py file. The GNN encoder runs once per timestep; outputs are stacked and fed to the Transformer over the sequence dimension.
+model.py — HeteroGNNEncoder
+import torch, torch.nn as nn, math
+from torch_geometric.nn import HeteroConv, SAGEConv
+class HeteroGNNEncoder(nn.Module):
+    def __init__(self, in_dim=1, hidden=32, out_dim=64):
+        super().__init__()
+        # NOVELTY: each node type gets its own conv weights
+        self.conv1 = HeteroConv({
+            ('macro','geo','macro'):   SAGEConv(in_dim, hidden),
+            ('pico','geo','pico'):     SAGEConv(in_dim, hidden),
+            ('femto','geo','femto'):   SAGEConv(in_dim, hidden),
+            ('macro','cross','pico'):  SAGEConv(in_dim, hidden),
+            ('macro','cross','femto'): SAGEConv(in_dim, hidden),
+        }, aggr='sum')
+        self.conv2 = HeteroConv({
+            ('macro','geo','macro'):   SAGEConv(hidden, out_dim),
+            ('pico','geo','pico'):     SAGEConv(hidden, out_dim),
+            ('femto','geo','femto'):   SAGEConv(hidden, out_dim),
+            ('macro','cross','pico'):  SAGEConv(hidden, out_dim),
+            ('macro','cross','femto'): SAGEConv(hidden, out_dim),
+        }, aggr='sum')
+        self.norm = nn.LayerNorm(out_dim)
+        self.proj = nn.ModuleDict({
+            'macro': nn.Linear(out_dim, out_dim),
+            'pico':  nn.Linear(out_dim, out_dim),
+            'femto': nn.Linear(out_dim, out_dim),
+        })
+    def forward(self, x_dict, edge_index_dict):
+        out = self.conv1(x_dict, edge_index_dict)
+        out = {k: torch.relu(v) for k, v in out.items()}
+        out = self.conv2(out, edge_index_dict)
+        out = {k: torch.relu(self.norm(v)) for k, v in out.items()}
+        return {k: self.proj[k](v) for k, v in out.items()}
+model.py — PositionalEncoding + TASTF
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=100):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0,d_model,2).float()*(-math.log(10000.0)/d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(1))
+    def forward(self, x): return x + self.pe[:x.size(0)]
+class TASTF(nn.Module):
+    def __init__(self, N, gnn_out=64, nhead=4, tf_layers=2, horizon=3,
+                 macro_idx=None, pico_idx=None, femto_idx=None):
+        super().__init__()
+        self.N, self.horizon = N, horizon
+        self.macro_idx, self.pico_idx, self.femto_idx = macro_idx, pico_idx, femto_idx
+        self.gnn = HeteroGNNEncoder(in_dim=1, hidden=32, out_dim=gnn_out)
+        self.pos_enc = PositionalEncoding(gnn_out)
+        enc_layer = nn.TransformerEncoderLayer(d_model=gnn_out, nhead=nhead,
+                        dim_feedforward=128, batch_first=False)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=tf_layers)
+        self.head = nn.Linear(gnn_out, horizon)
+    def forward(self, x_seq, hetero_graph):
+        B, T, N = x_seq.shape
+        spatial_seq = []
+        for t in range(T):
+            xt = x_seq[:, t, :]
+            x_dict = {
+                'macro': xt[:, self.macro_idx].reshape(-1, 1),
+                'pico':  xt[:, self.pico_idx].reshape(-1, 1),
+                'femto': xt[:, self.femto_idx].reshape(-1, 1),
+            }
+            emb = self.gnn(x_dict, hetero_graph.edge_index_dict)
+            full = torch.zeros(B, N, 64, device=x_seq.device)
+            full[:, self.macro_idx] = emb['macro'].view(B, -1, 64)
+            full[:, self.pico_idx]  = emb['pico'].view(B, -1, 64)
+            full[:, self.femto_idx] = emb['femto'].view(B, -1, 64)
+            spatial_seq.append(full)
+        seq = torch.stack(spatial_seq, dim=0).view(T, B*N, 64)
+        seq = self.pos_enc(seq)
+        out = self.transformer(seq)[-1]          # last timestep
+        pred = self.head(out).view(B, N, self.horizon).permute(0,2,1)
+        return pred                              # (B, horizon, N)
+Checkpoint  model(x_batch, hetero_graph) runs without error. pred.shape == (batch, 3, 100).
+Watch out  If you get NaN loss: ensure traffic values are normalised to [0,1] before training. Add torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) inside your training loop.
+5
+Training + baselines
+Hour 5:00 – 7:00
+train.py — full training loop
+import torch, torch.nn as nn, numpy as np
+from data_loader import load_telecom_italia
+from graph_builder import build_hetero_graph
+from model import TASTF
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+N_CELLS, SEQ_LEN, HORIZON = 100, 12, 3
+BATCH_SIZE, EPOCHS, LR = 32, 50, 1e-3
+(X_tr,y_tr),(X_val,y_val),(X_te,y_te),scaler = \
+    load_telecom_italia('./data', N_CELLS, SEQ_LEN, HORIZON)
+X_tr  = torch.tensor(X_tr,  dtype=torch.float32)
+y_tr  = torch.tensor(y_tr,  dtype=torch.float32)
+X_val = torch.tensor(X_val, dtype=torch.float32)
+y_val = torch.tensor(y_val, dtype=torch.float32)
+X_te  = torch.tensor(X_te,  dtype=torch.float32)
+y_te  = torch.tensor(y_te,  dtype=torch.float32)
+hetero, macro_idx, pico_idx, femto_idx = \
+    build_hetero_graph(X_tr.numpy().reshape(-1, N_CELLS))
+hetero = hetero.to(DEVICE)
+model = TASTF(N=N_CELLS, horizon=HORIZON,
+              macro_idx=macro_idx, pico_idx=pico_idx,
+              femto_idx=femto_idx).to(DEVICE)
+opt = torch.optim.Adam(model.parameters(), lr=LR)
+loss_fn = nn.MSELoss()
+best_val, patience, wait = 1e9, 10, 0
+for epoch in range(EPOCHS):
+    model.train()
+    perm = torch.randperm(len(X_tr))
+    train_loss = 0
+    for i in range(0, len(X_tr), BATCH_SIZE):
+        idx = perm[i:i+BATCH_SIZE]
+        xb, yb = X_tr[idx].to(DEVICE), y_tr[idx].to(DEVICE)
+        opt.zero_grad()
+        pred = model(xb, hetero)
+        loss = loss_fn(pred, yb)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        train_loss += loss.item()
+    model.eval()
+    with torch.no_grad():
+        val_pred = model(X_val.to(DEVICE), hetero)
+        val_loss = loss_fn(val_pred, y_val.to(DEVICE)).item()
+    print(f'Epoch {epoch+1:02d} | Train: {train_loss:.4f} | Val: {val_loss:.4f}')
+    if val_loss < best_val:
+        best_val = val_loss
+        torch.save(model.state_dict(), 'tastf_best.pt')
+        wait = 0
+    else:
+        wait += 1
+        if wait >= patience: print('Early stopping.'); break
+model.load_state_dict(torch.load('tastf_best.pt'))
+model.eval()
+with torch.no_grad():
+    te_pred = model(X_te.to(DEVICE), hetero).cpu().numpy()
+    te_true = y_te.numpy()
+mae  = np.mean(np.abs(te_pred - te_true))
+rmse = np.sqrt(np.mean((te_pred - te_true)**2))
+mape = np.mean(np.abs((te_pred-te_true)/(te_true+1e-5)))*100
+print(f'MAE: {mae:.4f} | RMSE: {rmse:.4f} | MAPE: {mape:.2f}%')
+Two baselines to run while TASTF trains
+Implement these in parallel while your main model trains. The HomoGCN+GRU baseline is the critical one — it is the same architecture but uses a homogeneous (non-tiered) graph, directly isolating the contribution of tier-aware node typing.
+Baseline 1 — LSTM: flatten the spatial dimension and train a standard per-cell LSTM. Provides a lower bound.
+Baseline 2 — HomoGCN+GRU: identical graph size but one node type, homogeneous SAGEConv + GRU. This is your ablation comparison.
+Checkpoint  Test results table shows TASTF beats both baselines on MAE and RMSE. Even 3-5% improvement is publishable with a clean ablation.
+6
+Results, ablation + paper skeleton
+Hour 7:00 – 8:00
+evaluate.py — plots and ablation
+import matplotlib.pyplot as plt
+import numpy as np
+def plot_tier_predictions(te_pred, te_true, macro_idx, pico_idx,
+                           femto_idx, horizon=0):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    for ax, idx, label in zip(axes,
+                              [macro_idx[0], pico_idx[0], femto_idx[0]],
+                              ['Macro BS', 'Pico BS', 'Femto BS']):
+        ax.plot(te_true[:100, horizon, idx], label='Ground truth')
+        ax.plot(te_pred[:100, horizon, idx], '--', label='TASTF')
+        ax.set_title(label)
+        ax.legend(fontsize=9)
+    plt.tight_layout()
+    plt.savefig('tier_predictions.png', dpi=150)
+# Ablation: retrain with cross-tier edges removed
+# In graph_builder.py, comment out the cross-tier edge lines
+# Record the MAE gap — this is Table 2 in your paper
+Checkpoint  tier_predictions.png saved. Ablation MAE recorded. All three baselines compared in the results table.
+Results table template
+Fill in your numbers after running all experiments. The teal row is your model.
+Model
+MAE
+RMSE
+MAPE (%)
+Notes
+LSTM baseline
+Fill after run
+Fill after run
+Fill after run
+Flat spatial
+HomoGCN+GRU
+Fill after run
+Fill after run
+Fill after run
+No tier separation
+TASTF (ours)
+TARGET
+TARGET
+TARGET
+Tier-aware graph + Transformer
+Paper novelty claim
+Unlike prior GNN-based cellular traffic prediction works that treat all base stations as homogeneous nodes, TASTF constructs a heterogeneous graph with macro, pico, and femto node types and applies type-specific convolutional layers via PyTorch Geometric HeteroConv. This enables the model to learn tier-distinct spatial propagation patterns — demonstrated by consistent MAE/RMSE improvements over HGCRN (Liu et al., 2024) and GAST (He et al., 2022) on the Telecom Italia Milan dataset, with an ablation confirming that cross-tier edges are the primary driver of improvement.
+Paper section outline
+Section
+Content
+Abstract
+State the problem (tier heterogeneity ignored in prior GNN work), your method (HeteroConv with 3 node types), key result (X% MAE improvement over HGCRN on Telecom Italia).
+1. Introduction
+Cite the 6 research gaps from your literature survey. Identify gap #3 (cross-tier heterogeneity) as your focus. State contributions as 3 bullet points.
+2. Related work
+Summarise Section 5 of your survey (GNN methods). Position against Wang et al. 2022, Liu et al. 2024 (HGCRN), He et al. 2022 (GAST). One paragraph each.
+3. System model
+Define the HetNet graph formally: G = (V_macro, V_pico, V_femto, E_geo, E_cross). Describe tier assignment rule. Describe the three edge types.
+4. TASTF model
+Describe HeteroGNNEncoder, PositionalEncoding, TransformerEncoder, prediction head. Include model architecture figure (tier_predictions.png or a diagram).
+5. Experiments
+Dataset: Telecom Italia Milan. Metrics: MAE, RMSE, MAPE. Baselines: LSTM, HomoGCN+GRU, HGCRN. Results table. Ablation table (with/without cross-tier edges).
+6. Conclusion
+Summarise gains. State future work: add non-stationarity module (Solution 3), extend to DRL proactive management (Solution 4).
+Quick reference
+Hyperparameter
+Value  (change if training is slow)
+Input window (seq_len)
+12 timesteps  (~2 hrs of 10-min intervals)
+Forecast horizon
+3 steps  (change to 6 for longer-term experiments)
+GNN hidden dim
+32  (reduce to 16 if running on CPU)
+GNN output dim
+64
+Transformer heads
+4  (must divide GNN output dim evenly)
+Transformer layers
+2
+Batch size
+32
+Learning rate
+1e-3  (try 5e-4 if loss oscillates)
+Max epochs
+50 with early stopping (patience=10)
+k for k-NN graph
+5 neighbours per node
+Macro threshold
+Top 10% activity cells
+Femto threshold
+Bottom 30% activity cells
+File structure
+project/
+  data/
+    sms-call-internet-mi-2013-11.txt
+  data_loader.py
+  graph_builder.py
+  model.py
+  train.py
+  evaluate.py
+  tastf_best.pt          <- saved after training
+  tier_predictions.png   <- generated by evaluate.py
+If something breaks
+NaN loss  ->  normalise input to [0,1], add gradient clipping (already in train.py)
+CUDA OOM  ->  reduce BATCH_SIZE to 16 or N_CELLS to 50
+PyG import error  ->  pip install torch-scatter torch-sparse --no-binary all
+Slow on CPU  ->  reduce hidden=16, tf_layers=1, and use N_CELLS=50
+Edge index out of range  ->  check that local id maps in graph_builder are consistent
+TASTF Implementation Plan  |  Solution 2 of 5  |  Target: IEEE Communications Letters / IEEE TMC
