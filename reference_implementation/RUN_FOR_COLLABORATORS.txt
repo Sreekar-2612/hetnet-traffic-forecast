@@ -1,9 +1,10 @@
 TASTF — how to run after git clone
 ==================================
 
-1) Data
+1) Data (local default)
    - Put all Milan Telecom Italia files `sms-call-internet-mi-*.txt` in:
      hetnet-traffic-forecast/Wireless Dataset/
+     (same folder level as reference_implementation/ — train.py and paths.py pick this up automatically)
    - Optional: add `milano-grid.geojson` next to the repo and pass:
      python train.py --geojson path/to/milano-grid.geojson
 

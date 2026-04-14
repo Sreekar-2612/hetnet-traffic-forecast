@@ -92,7 +92,15 @@ def train_core(args: SimpleNamespace) -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
 
-    data_dir = args.data_dir or resolve_wireless_dataset_dir(None)
+    if args.data_dir:
+        data_dir = args.data_dir
+    else:
+        # Prefer hetnet-traffic-forecast/Wireless Dataset next to this package
+        _local = _ROOT.parent / "Wireless Dataset"
+        if _local.is_dir() and any(_local.glob("*.txt")):
+            data_dir = str(_local.resolve())
+        else:
+            data_dir = resolve_wireless_dataset_dir(None)
     print(f"DATA_DIR = {data_dir}")
 
     r = load_telecom_italia(data_dir, random_seed=args.seed)

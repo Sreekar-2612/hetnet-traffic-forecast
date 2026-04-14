@@ -47,6 +47,17 @@ def resolve_wireless_dataset_dir(explicit: str | None = None) -> str:
         if _has_txt(p):
             return str(p)
 
+    # Canonical layout: .../hetnet-traffic-forecast/Wireless Dataset (sibling of reference_implementation/)
+    _ref_dir = Path(__file__).resolve().parent
+    _repo_root = _ref_dir.parent
+    for cand in (
+        _repo_root / "Wireless Dataset",
+        _repo_root / "wireless dataset",
+        _repo_root / "wireless_dataset",
+    ):
+        if _has_txt(cand):
+            return str(cand)
+
     f = inspect.currentframe()
     try:
         while f:
@@ -67,6 +78,8 @@ def resolve_wireless_dataset_dir(explicit: str | None = None) -> str:
 
     cwd = Path.cwd().resolve()
     candidates = (
+        cwd.parent / "Wireless Dataset",
+        cwd.parent / "wireless dataset",
         cwd / "hetnet-traffic-forecast" / "Wireless Dataset",
         cwd / "hetnet-traffic-forecast" / "wireless dataset",
         cwd / "hetnet-traffic-forecast" / "wireless_dataset",
