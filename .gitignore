@@ -12,6 +12,13 @@ __pycache__/
 wireless dataset/
 .wireless dataset/
 
+# Training outputs (regenerate with train.py)
+reference_implementation/*.pt
+reference_implementation/*.npz
+*.npz
+tier_predictions.png
+spatial_error_map.png
+
 # IDE settings
 .qodo/
 .vscode/

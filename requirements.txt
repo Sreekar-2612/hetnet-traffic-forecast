@@ -1,0 +1,9 @@
+# Core (install torch for your platform separately: https://pytorch.org )
+numpy>=1.23
+pandas>=1.5
+scikit-learn>=1.2
+matplotlib>=3.7
+torch-geometric>=2.3
+
+# Optional
+# mlflow>=2.10

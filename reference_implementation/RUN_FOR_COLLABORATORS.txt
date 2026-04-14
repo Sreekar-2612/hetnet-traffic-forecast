@@ -1,0 +1,50 @@
+TASTF — how to run after git clone
+==================================
+
+1) Data
+   - Put all Milan Telecom Italia files `sms-call-internet-mi-*.txt` in:
+     hetnet-traffic-forecast/Wireless Dataset/
+   - Optional: add `milano-grid.geojson` next to the repo and pass:
+     python train.py --geojson path/to/milano-grid.geojson
+
+2) Environment
+   - Install PyTorch for your OS/CUDA from https://pytorch.org
+   - pip install -r requirements.txt   (from hetnet-traffic-forecast/)
+   - Install torch-scatter / torch-sparse matching your torch version:
+     pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-<TORCH_VER>+<CUDA_OR_CPU>.html
+
+3) Train (recommended)
+   cd hetnet-traffic-forecast/reference_implementation
+   python train.py --data-dir "../Wireless Dataset"
+
+   Useful flags:
+   --ablation homo          homogeneous graph ablation
+   --use-gat                GAT instead of SAGE
+   --no-temporal            disable hour/dow features
+   --probabilistic          Gaussian NLL head
+   --baselines-only         only naive + Ridge
+   --mlflow                 log metrics (pip install mlflow)
+
+4) Notebook
+   Open TASTF_Implementation.ipynb from hetnet-traffic-forecast/, run cells in order.
+   Set env TASTF_DATA_DIR if data is not auto-discovered.
+
+5) After training — saved artifacts (reference_implementation/)
+   tastf_best.pt           — best validation weights (used for test eval)
+   tastf_model_weights.pt  — same final model state_dict (convenience copy)
+   tastf_checkpoint.pt     — full bundle: weights + config + split_info + args (for reload)
+   results.npz             — predictions, scaler arrays, coords
+
+   Reload for inference:
+   python load_checkpoint.py tastf_checkpoint.pt
+   Or in code:
+     from load_checkpoint import load_model_from_checkpoint
+     model, ckpt = load_model_from_checkpoint('tastf_checkpoint.pt')
+
+6) Metrics & figures
+   python read_metrics.py
+   python evaluate.py
+   python -c "from viz import plot_error_map_from_npz; plot_error_map_from_npz()"
+
+7) Synthetic demo data (only if needed)
+   set TASTF_USE_SYNTHETIC=1  (writes small fake .txt — not for real benchmarks)
